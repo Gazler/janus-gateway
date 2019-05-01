@@ -139,7 +139,7 @@ $(document).ready(function() {
 														success: function(jsep) {
 															Janus.debug("Got SDP!");
 															Janus.debug(jsep);
-															var publish = { "request": "configure", "muted": false };
+															var publish = { "request": "configure", "muted": true };
 															mixertest.send({"message": publish, "jsep": jsep});
 														},
 														error: function(error) {
@@ -290,7 +290,7 @@ $(document).ready(function() {
 									if(!addButtons)
 										return;
 									// Mute button
-									audioenabled = true;
+									audioenabled = false;
 									$('#toggleaudio').click(
 										function() {
 											audioenabled = !audioenabled;

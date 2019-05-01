@@ -3320,7 +3320,7 @@ static void *janus_audiobridge_handler(void *data) {
 			participant->user_id = user_id;
 			g_free(participant->display);
 			participant->display = display_text ? g_strdup(display_text) : NULL;
-			participant->muted = muted ? json_is_true(muted) : FALSE;	/* By default, everyone's unmuted when joining */
+			participant->muted = muted ? json_is_true(muted) : TRUE;	/* By default, everyone's muted when joining */
 			participant->volume_gain = volume;
 			participant->opus_complexity = complexity;
 			if(participant->outbuf == NULL)
