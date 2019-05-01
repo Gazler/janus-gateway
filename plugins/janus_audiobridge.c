@@ -2914,6 +2914,14 @@ void janus_audiobridge_incoming_rtp(janus_plugin_session *handle, int video, cha
 			g_free(pkt);
 			return;
 		}
+
+		gchar *encoded = g_base64_encode(payload, plen);
+
+		json_t *event = json_object();
+		json_object_set_new(event, "audio_payload", json_string(encoded));
+		int ret = gateway->push_event(participant->session->handle, &janus_audiobridge_plugin, NULL, event, NULL);
+		JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
+
 		/* Check sequence number received, verify if it's relevant to the expected one */
 		if(pkt->seq_number == participant->expected_seq) {
 			/* Regular decode */
