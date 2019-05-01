@@ -352,6 +352,8 @@ AC_CHECK_LIB([dl],
              [JANUS_MANUAL_LIBS="${JANUS_MANUAL_LIBS} -ldl"],
              [AC_MSG_ERROR([libdl not found.])])
 
+AC_CHECK_LIB(uuid, main,,AC_MSG_ERROR(please install libuuid))
+
 AM_CONDITIONAL([ENABLE_LIBSRTP_2], false)
 AS_IF([test "x$enable_libsrtp2" != "xno"],
       [AC_CHECK_LIB([srtp2],
