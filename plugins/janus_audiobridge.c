@@ -1881,7 +1881,7 @@ struct janus_plugin_result *janus_audiobridge_handle_message(janus_plugin_sessio
 		/* Create the audio bridge room */
 		janus_audiobridge_room *audiobridge = g_malloc0(sizeof(janus_audiobridge_room));
 		uuid_parse(room_uuid_string, audiobridge->room_id);
-		audiobridge->room_uuid_string = room_uuid_string;
+		audiobridge->room_uuid_string = g_strdup(room_uuid_string);
 		char *description = NULL;
 		if(desc != NULL && strlen(json_string_value(desc)) > 0) {
 			description = g_strdup(json_string_value(desc));
@@ -3415,7 +3415,7 @@ static void *janus_audiobridge_handler(void *data) {
 			}
 			participant->session = session;
 			participant->room = audiobridge;
-			participant->user_uuid_string = user_uuid_string;
+			participant->user_uuid_string = g_strdup(user_uuid_string);
 			uuid_parse(participant->user_uuid_string, participant->user_id);
 			g_free(participant->display);
 			participant->display = display_text ? g_strdup(display_text) : NULL;
