@@ -965,6 +965,14 @@ static struct janus_json_parameter join_parameters[] = {
 	{"audio_active_packets", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
 	{"secret", JSON_STRING, 0}
 };
+static struct janus_json_parameter add_external_uploader_parameters[] = {
+	{"room", JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
+	{"id", JSON_STRING, JANUS_JSON_PARAM_REQUIRED}
+};
+static struct janus_json_parameter remove_external_uploader_parameters[] = {
+	{"room", JSON_STRING, JANUS_JSON_PARAM_REQUIRED},
+	{"id", JSON_STRING, JANUS_JSON_PARAM_REQUIRED}
+};
 static struct janus_json_parameter configure_parameters[] = {
 	{"muted", JANUS_JSON_BOOL, 0},
 	{"prebuffer", JSON_INTEGER, JANUS_JSON_PARAM_POSITIVE},
@@ -1049,6 +1057,7 @@ typedef struct janus_audiobridge_room {
 	gint64 record_lastupdate;	/* Time when we last updated the wav header */
 	gboolean destroy;			/* Value to flag the room for destruction */
 	GHashTable *participants;	/* Map of participants */
+	GHashTable *external_uploaders;	/* Map of external uploads */
 	GHashTable *anncs;			/* Map of announcements */
 	gboolean check_tokens;		/* Whether to check tokens when participants join (see below) */
 	gboolean muted;				/* Whether the room is globally muted (except for admins and played files) */
@@ -1074,6 +1083,7 @@ typedef struct janus_audiobridge_session {
 	gint64 sdp_sessid;
 	gint64 sdp_version;
 	gpointer participant;
+	gpointer external_uploader;
 	volatile gint started;
 	volatile gint hangingup;
 	volatile gint destroyed;
@@ -1282,6 +1292,33 @@ typedef struct janus_audiobridge_participant {
 	janus_refcount ref;			/* Reference counter for this participant */
 } janus_audiobridge_participant;
 
+typedef struct janus_audiobridge_external_uploader {
+	janus_audiobridge_session *session;
+	janus_audiobridge_room *room;	/* Room */
+	volatile gint decoding;	/* Whether this participant is currently decoding */
+	gchar *user_id_str;		/* Unique ID in the room (when using strings) */
+	gboolean prebuffering;	/* Whether this participant needs pre-buffering of a few packets (just joined) */
+	int volume_gain;		/* Gain to apply to the input audio (in percentage) */
+	int opus_complexity;	/* Complexity to use in the encoder (by default, DEFAULT_COMPLEXITY) */
+	/* RTP stuff */
+	GList *inbuf;			/* Incoming audio from this participant, as an ordered list of packets */
+	gint64 last_drop;		/* When we last dropped a packet because the imcoming queue was full */
+	janus_mutex qmutex;		/* Incoming queue mutex */
+	int opus_pt;			/* Opus payload type */
+	int extmap_id;			/* Audio level RTP extension id, if any */
+	int dBov_level;			/* Value in dBov of the audio level (last value from extension) */
+	int audio_active_packets;	/* Participant's number of audio packets to accumulate */
+	int audio_dBov_sum;	    /* Participant's accumulated dBov value for audio level */
+	OpusDecoder *decoder;		/* Opus decoder instance */
+	gboolean fec;				/* Opus FEC status */
+	uint16_t expected_seq;		/* Expected sequence number */
+	uint16_t seq_number;		/* current sequence number */
+	uint16_t probation; 		/* Used to determine new ssrc validity */
+	uint32_t last_timestamp;	/* Last in seq timestamp */
+	gboolean reset;				/* Whether or not the Opus context must be reset, without re-joining the room */
+	janus_refcount ref;			/* Reference counter for this participant */
+} janus_audiobridge_external_uploader;
+
 typedef struct janus_audiobridge_rtp_relay_packet {
 	janus_rtp_header *data;
 	gint length;
@@ -1291,6 +1328,7 @@ typedef struct janus_audiobridge_rtp_relay_packet {
 	gboolean silence;
 } janus_audiobridge_rtp_relay_packet;
 
+static void janus_audiobridge_external_audio(janus_audiobridge_external_uploader *uploader, janus_plugin_rtcp *packet);
 
 static void janus_audiobridge_participant_destroy(janus_audiobridge_participant *participant) {
 	if(!participant)
@@ -1301,11 +1339,25 @@ static void janus_audiobridge_participant_destroy(janus_audiobridge_participant 
 	janus_refcount_decrease(&participant->ref);
 }
 
+static void janus_audiobridge_external_uploader_destroy(janus_audiobridge_external_uploader *external_uploader) {
+	if(!external_uploader)
+		return;
+	/* Decrease the counter */
+	janus_refcount_decrease(&external_uploader->ref);
+}
+
 static void janus_audiobridge_participant_unref(janus_audiobridge_participant *participant) {
 	if(!participant)
 		return;
 	/* Just decrease the counter */
 	janus_refcount_decrease(&participant->ref);
+}
+
+static void janus_audiobridge_external_uploader_unref(janus_audiobridge_external_uploader *external_uploader) {
+	if(!external_uploader)
+		return;
+	/* Just decrease the counter */
+	janus_refcount_decrease(&external_uploader->ref);
 }
 
 static void janus_audiobridge_participant_free(const janus_refcount *participant_ref) {
@@ -1339,6 +1391,23 @@ static void janus_audiobridge_participant_free(const janus_refcount *participant
 	g_free(participant);
 }
 
+static void janus_audiobridge_external_uploader_free(const janus_refcount *external_uploader_ref) {
+	janus_audiobridge_external_uploader *external_uploader = janus_refcount_containerof(external_uploader_ref, janus_audiobridge_external_uploader, ref);
+	if(external_uploader->decoder)
+		opus_decoder_destroy(external_uploader->decoder);
+	while(external_uploader->inbuf) {
+		GList *first = g_list_first(external_uploader->inbuf);
+		janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)first->data;
+		external_uploader->inbuf = g_list_remove_link(external_uploader->inbuf, first);
+		if(pkt)
+			g_free(pkt->data);
+		g_free(pkt);
+	}
+	if (&external_uploader->room)
+		g_hash_table_remove(external_uploader->room->external_uploaders, (gpointer)external_uploader->user_id_str);
+	g_free(external_uploader);
+}
+
 static void janus_audiobridge_session_destroy(janus_audiobridge_session *session) {
 	if(session && g_atomic_int_compare_and_exchange(&session->destroyed, 0, 1))
 		janus_refcount_decrease(&session->ref);
@@ -1349,6 +1418,8 @@ static void janus_audiobridge_session_free(const janus_refcount *session_ref) {
 	/* Destroy the participant instance, if any */
 	if(session->participant)
 		janus_audiobridge_participant_destroy(session->participant);
+	if(session->external_uploader)
+		janus_audiobridge_external_uploader_destroy(session->external_uploader);
 	/* Remove the reference to the core plugin session */
 	janus_refcount_decrease(&session->handle->ref);
 	/* This session can be destroyed, free all the resources */
@@ -2147,6 +2218,11 @@ int janus_audiobridge_init(janus_callbacks *callback, const char *config_path) {
 			audiobridge->participants = g_hash_table_new_full(
 				string_ids ? g_str_hash : g_int64_hash, string_ids ? g_str_equal : g_int64_equal,
 				(GDestroyNotify)g_free, (GDestroyNotify)janus_audiobridge_participant_unref);
+
+			audiobridge->external_uploaders = g_hash_table_new_full(
+				string_ids ? g_str_hash : g_int64_hash, string_ids ? g_str_equal : g_int64_equal,
+				(GDestroyNotify)g_free, (GDestroyNotify)janus_audiobridge_external_uploader_unref);
+
 			audiobridge->anncs = g_hash_table_new_full(g_str_hash, g_str_equal,
 				(GDestroyNotify)g_free, (GDestroyNotify)janus_audiobridge_participant_unref);
 			audiobridge->check_tokens = FALSE;	/* Static rooms can't have an "allowed" list yet, no hooks to the configuration file */
@@ -2608,6 +2684,9 @@ static json_t *janus_audiobridge_process_synchronous_request(janus_audiobridge_s
 		audiobridge->participants = g_hash_table_new_full(
 			string_ids ? g_str_hash : g_int64_hash, string_ids ? g_str_equal : g_int64_equal,
 			(GDestroyNotify)g_free, (GDestroyNotify)janus_audiobridge_participant_unref);
+		audiobridge->external_uploaders = g_hash_table_new_full(
+		  string_ids ? g_str_hash : g_int64_hash, string_ids ? g_str_equal : g_int64_equal,
+		  (GDestroyNotify)g_free, (GDestroyNotify)janus_audiobridge_external_uploader_unref);
 		audiobridge->anncs = g_hash_table_new_full(g_str_hash, g_str_equal,
 			(GDestroyNotify)g_free, (GDestroyNotify)janus_audiobridge_participant_unref);
 		audiobridge->allowed = g_hash_table_new_full(g_str_hash, g_str_equal, (GDestroyNotify)g_free, NULL);
@@ -4418,7 +4497,10 @@ struct janus_plugin_result *janus_audiobridge_handle_message(janus_plugin_sessio
 		/* We got a response, send it back */
 		goto plugin_response;
 	} else if(!strcasecmp(request_text, "join") || !strcasecmp(request_text, "configure")
-			|| !strcasecmp(request_text, "changeroom") || !strcasecmp(request_text, "leave")) {
+			|| !strcasecmp(request_text, "changeroom") || !strcasecmp(request_text, "leave")
+			|| !strcasecmp(request_text, "add_external_uploader")
+			|| !strcasecmp(request_text, "remove_external_uploader")
+			|| !strcasecmp(request_text, "external_uploader_audio_data")) {
 		/* These messages are handled asynchronously */
 		janus_audiobridge_message *msg = g_malloc(sizeof(janus_audiobridge_message));
 		msg->handle = handle;
@@ -4715,6 +4797,14 @@ void janus_audiobridge_incoming_rtp(janus_plugin_session *handle, janus_plugin_r
 			g_free(pkt);
 			return;
 		}
+
+		gchar *encoded = g_base64_encode(payload, plen);
+
+		json_t *event = json_object();
+		json_object_set_new(event, "audio_payload", json_string(encoded));
+		int ret = gateway->push_event(participant->session->handle, &janus_audiobridge_plugin, NULL, event, NULL);
+		JANUS_LOG(LOG_VERB, "  >> %d (%s)\n", ret, janus_get_api_error(ret));
+
 		/* Check sequence number received, verify if it's relevant to the expected one */
 		if(pkt->seq_number == participant->expected_seq) {
 			/* Regular decode */
@@ -6085,6 +6175,238 @@ static void *janus_audiobridge_handler(void *data) {
 				/* Only decrease the counter if we were still there */
 				janus_refcount_decrease(&audiobridge->ref);
 			}
+		} else if(!strcasecmp(request_text, "add_external_uploader")) {
+			JANUS_LOG(LOG_VERB, "Adding new external uploader\n");
+
+			JANUS_VALIDATE_JSON_OBJECT(root, add_external_uploader_parameters,
+				error_code, error_cause, TRUE,
+				JANUS_AUDIOBRIDGE_ERROR_MISSING_ELEMENT, JANUS_AUDIOBRIDGE_ERROR_INVALID_ELEMENT);
+			if(error_code != 0)
+				goto error;
+
+			json_t *room = json_object_get(root, "room");
+			char *room_id_str = NULL;
+			room_id_str = (char *)json_string_value(room);
+
+			janus_mutex_lock(&rooms_mutex);
+
+			janus_audiobridge_room *audiobridge = g_hash_table_lookup(rooms, (gpointer)room_id_str);
+			if(audiobridge == NULL || g_atomic_int_get(&audiobridge->destroyed)) {
+				janus_mutex_unlock(&rooms_mutex);
+				JANUS_LOG(LOG_ERR, "No such room (%s)\n", room_id_str);
+				error_code = JANUS_AUDIOBRIDGE_ERROR_NO_SUCH_ROOM;
+				g_snprintf(error_cause, 512, "No such room (%s)", room_id_str);
+				goto error;
+			}
+
+			janus_refcount_increase(&audiobridge->ref);
+			janus_mutex_lock(&audiobridge->mutex);
+			janus_mutex_unlock(&rooms_mutex);
+
+			int volume = 100;
+			int complexity = DEFAULT_COMPLEXITY;
+			json_t *id = json_object_get(root, "id");
+			if(!id) {
+				JANUS_LOG(LOG_ERR, "User ID not set\n");
+				error_code = JANUS_AUDIOBRIDGE_ERROR_NO_SUCH_USER;
+				g_snprintf(error_cause, 512, "User ID not set");
+				goto error;
+			}
+
+			char *user_id_str = NULL;
+			user_id_str = (char *)json_string_value(id);
+			if(g_hash_table_lookup(audiobridge->external_uploaders, (gpointer)user_id_str) != NULL) {
+				/* User ID already taken */
+				janus_mutex_unlock(&audiobridge->mutex);
+				janus_refcount_decrease(&audiobridge->ref);
+				JANUS_LOG(LOG_ERR, "User ID %s already exists\n", user_id_str);
+				error_code = JANUS_AUDIOBRIDGE_ERROR_ID_EXISTS;
+				g_snprintf(error_cause, 512, "User ID %s already exists", user_id_str);
+				goto error;
+			}
+
+			JANUS_LOG(LOG_WARN, "  -- External Uploader ID: %s\n", user_id_str);
+			janus_audiobridge_external_uploader *external_uploader = g_malloc0(sizeof(janus_audiobridge_external_uploader));
+			janus_refcount_init(&external_uploader->ref, janus_audiobridge_external_uploader_free);
+			external_uploader->prebuffering = FALSE;
+			external_uploader->inbuf = NULL;
+			external_uploader->last_drop = 0;
+			external_uploader->decoder = NULL;
+			external_uploader->reset = FALSE;
+			external_uploader->fec = FALSE;
+			external_uploader->expected_seq = 0;
+			external_uploader->probation = 0;
+			external_uploader->last_timestamp = 0;
+			janus_mutex_init(&external_uploader->qmutex);
+			external_uploader->session = session;
+			external_uploader->room = audiobridge;
+			external_uploader->user_id_str = g_strdup(user_id_str);
+			external_uploader->volume_gain = volume;
+			external_uploader->opus_complexity = complexity;
+			external_uploader->opus_pt = 0;
+			external_uploader->extmap_id = 0;
+			external_uploader->dBov_level = 0;
+			JANUS_LOG(LOG_VERB, "Creating Opus encoder/decoder (sampling rate %d)\n", audiobridge->sampling_rate);
+			int error = 0;
+			if(external_uploader->decoder == NULL) {
+				/* Opus decoder */
+				error = 0;
+				external_uploader->decoder = opus_decoder_create(audiobridge->sampling_rate, 1, &error);
+				if(error != OPUS_OK) {
+					janus_mutex_unlock(&audiobridge->mutex);
+					janus_refcount_decrease(&audiobridge->ref);
+					if(external_uploader->decoder)
+						opus_decoder_destroy(external_uploader->decoder);
+					external_uploader->decoder = NULL;
+					g_free(external_uploader);
+					JANUS_LOG(LOG_ERR, "Error creating Opus encoder\n");
+					error_code = JANUS_AUDIOBRIDGE_ERROR_LIBOPUS_ERROR;
+					g_snprintf(error_cause, 512, "Error creating Opus decoder");
+					goto error;
+				}
+			}
+			external_uploader->reset = FALSE;
+			session->external_uploader = external_uploader;
+
+			/* Done */
+			g_hash_table_insert(audiobridge->external_uploaders, (gpointer)g_strdup(external_uploader->user_id_str), external_uploader);
+			janus_mutex_unlock(&audiobridge->mutex);
+			event = json_object();
+			json_object_set_new(event, "audiobridge", json_string("external_uploader_created"));
+			json_object_set_new(event, "room", json_string(room_id_str));
+			json_object_set_new(event, "id", json_string(user_id_str));
+			/* Also notify event handlers */
+			if(notify_events && gateway->events_is_enabled()) {
+				json_t *info = json_object();
+				json_object_set_new(info, "event", json_string("external_uploader_created"));
+				json_object_set_new(info, "room", json_string(room_id_str));
+				json_object_set_new(info, "id", json_string(user_id_str));
+				gateway->notify_event(&janus_audiobridge_plugin, session->handle, info);
+			}
+		} else if(!strcasecmp(request_text, "remove_external_uploader")) {
+			JANUS_VALIDATE_JSON_OBJECT(root, remove_external_uploader_parameters,
+				error_code, error_cause, TRUE,
+				JANUS_AUDIOBRIDGE_ERROR_MISSING_ELEMENT, JANUS_AUDIOBRIDGE_ERROR_INVALID_ELEMENT);
+			if(error_code != 0)
+				goto error;
+
+			json_t *room = json_object_get(root, "room");
+			char *room_id_str = NULL;
+			room_id_str = (char *)json_string_value(room);
+
+			janus_mutex_lock(&rooms_mutex);
+
+			janus_audiobridge_room *audiobridge = g_hash_table_lookup(rooms, (gpointer)room_id_str);
+			if(audiobridge == NULL || g_atomic_int_get(&audiobridge->destroyed)) {
+				janus_mutex_unlock(&rooms_mutex);
+				JANUS_LOG(LOG_ERR, "No such room (%s)\n", room_id_str);
+				error_code = JANUS_AUDIOBRIDGE_ERROR_NO_SUCH_ROOM;
+				g_snprintf(error_cause, 512, "No such room (%s)", room_id_str);
+				goto error;
+			}
+
+			janus_refcount_increase(&audiobridge->ref);
+			janus_mutex_lock(&audiobridge->mutex);
+			janus_mutex_unlock(&rooms_mutex);
+
+			json_t *id = json_object_get(root, "id");
+			if(!id) {
+				JANUS_LOG(LOG_ERR, "User ID not set\n");
+				error_code = JANUS_AUDIOBRIDGE_ERROR_NO_SUCH_USER;
+				g_snprintf(error_cause, 512, "User ID not set");
+				goto error;
+			}
+
+			char *user_id_str = NULL;
+			user_id_str = (char *)json_string_value(id);
+
+			janus_audiobridge_external_uploader *external_uploader = g_hash_table_lookup(audiobridge->external_uploaders, (gpointer)user_id_str);
+			if(external_uploader == NULL) {
+				/* User ID already taken */
+				janus_mutex_unlock(&audiobridge->mutex);
+				janus_refcount_decrease(&audiobridge->ref);
+				JANUS_LOG(LOG_ERR, "User ID %s Not in room\n", user_id_str);
+				error_code = JANUS_AUDIOBRIDGE_ERROR_ID_EXISTS;
+				g_snprintf(error_cause, 512, "User ID %s not in room", user_id_str);
+				goto error;
+			}
+
+			janus_audiobridge_external_uploader_unref(external_uploader);
+			janus_mutex_unlock(&audiobridge->mutex);
+			event = json_object();
+			json_object_set_new(event, "audiobridge", json_string("external_uploader_removed"));
+			json_object_set_new(event, "room", json_string(room_id_str));
+			json_object_set_new(event, "id", json_string(user_id_str));
+			/* Also notify event handlers */
+			if(notify_events && gateway->events_is_enabled()) {
+				json_t *info = json_object();
+				json_object_set_new(info, "event", json_string("external_uploader_removed"));
+				json_object_set_new(info, "room", json_string(room_id_str));
+				json_object_set_new(info, "id", json_string(user_id_str));
+				gateway->notify_event(&janus_audiobridge_plugin, session->handle, info);
+			}
+
+		} else if(!strcasecmp(request_text, "external_uploader_audio_data")) {
+			json_t *room = json_object_get(root, "room");
+
+			char *room_id_str = NULL;
+			room_id_str = (char *)json_string_value(room);
+
+			janus_mutex_lock(&rooms_mutex);
+			janus_audiobridge_room *audiobridge = g_hash_table_lookup(rooms, (gpointer)room_id_str);
+			if(audiobridge == NULL || g_atomic_int_get(&audiobridge->destroyed)) {
+				janus_mutex_unlock(&rooms_mutex);
+				JANUS_LOG(LOG_ERR, "No such room (%s)\n", room_id_str);
+				error_code = JANUS_AUDIOBRIDGE_ERROR_NO_SUCH_ROOM;
+				g_snprintf(error_cause, 512, "No such room (%s)", room_id_str);
+				goto error;
+			}
+			janus_mutex_unlock(&rooms_mutex);
+
+			json_t *audio_payload = json_object_get(root, "audio_payload");
+			const char *audio_payload_text = audio_payload ? json_string_value(audio_payload) : NULL;
+			if (audio_payload_text == NULL) {
+				JANUS_LOG(LOG_ERR, "Error decoding payload\n");
+				error_code = JANUS_AUDIOBRIDGE_ERROR_MISSING_ELEMENT;
+				g_snprintf(error_cause, 512, "Error decoding payload");
+				goto error;
+			}
+
+			json_t *id = json_object_get(root, "id");
+			if(!id) {
+				JANUS_LOG(LOG_ERR, "User id is missing when uploading audio data");
+				error_code = JANUS_AUDIOBRIDGE_ERROR_MISSING_ELEMENT;
+				g_snprintf(error_cause, 512, "User ID missing");
+				goto error;
+			}
+
+			char *user_id_str = NULL;
+			user_id_str = (char *)json_string_value(id);
+
+			janus_audiobridge_external_uploader *uploader = g_hash_table_lookup(audiobridge->external_uploaders, (gpointer)user_id_str);
+
+			if(uploader == NULL) {
+				JANUS_LOG(LOG_ERR, "User ID %s not found\n", user_id_str);
+				error_code = JANUS_AUDIOBRIDGE_ERROR_ID_EXISTS;
+				g_snprintf(error_cause, 512, "User ID %s not found", user_id_str);
+				goto error;
+			}
+
+			gsize len;
+			char *decoded_payload = (char *)g_base64_decode(audio_payload_text, &len);
+			if (len == 0) {
+				JANUS_LOG(LOG_ERR, "Error decoding base64 payload data\n");
+				error_code = JANUS_AUDIOBRIDGE_ERROR_MISSING_ELEMENT;
+				g_snprintf(error_cause, 512, "Error decoding payload");
+				goto error;
+			}
+
+			janus_plugin_rtcp rtcp = { .video = FALSE, .buffer = decoded_payload, .length = len };
+			janus_audiobridge_external_audio(uploader, &rtcp);
+
+			event = json_object();
+			json_object_set_new(event, "audiobridge", json_string("external_upload_data"));
+			json_object_set_new(event, "id", json_string(user_id_str));
 		} else {
 			JANUS_LOG(LOG_ERR, "Unknown request '%s'\n", request_text);
 			error_code = JANUS_AUDIOBRIDGE_ERROR_INVALID_REQUEST;
@@ -6361,6 +6683,7 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 		ts += OPUS_SAMPLES;
 		/* Mix all contributions */
 		GList *participants_list = g_hash_table_get_values(audiobridge->participants);
+		GList *external_uploaders_list = g_hash_table_get_values(audiobridge->external_uploaders);
 		/* Add a reference to all these participants, in case some leave while we're mixing */
 		GList *ps = participants_list;
 		while(ps) {
@@ -6368,6 +6691,14 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			janus_refcount_increase(&p->ref);
 			ps = ps->next;
 		}
+
+		GList *eu = external_uploaders_list;
+		while(eu) {
+			janus_audiobridge_external_uploader *e = (janus_audiobridge_external_uploader *)eu->data;
+			janus_refcount_increase(&e->ref);
+			eu = eu->next;
+		}
+
 		janus_mutex_unlock_nodebug(&audiobridge->mutex);
 		for(i=0; i<samples; i++)
 			buffer[i] = 0;
@@ -6406,6 +6737,39 @@ static void *janus_audiobridge_mixer_thread(void *data) {
 			janus_mutex_unlock(&p->qmutex);
 			ps = ps->next;
 		}
+
+		eu = external_uploaders_list;
+		while(eu) {
+			janus_audiobridge_external_uploader *e = (janus_audiobridge_external_uploader *)eu->data;
+			janus_mutex_lock(&e->qmutex);
+			if(e->prebuffering || !e->inbuf) {
+				janus_mutex_unlock(&e->qmutex);
+				janus_refcount_decrease(&e->ref);
+				eu = eu->next;
+				continue;
+			}
+			GList *peek = g_list_first(e->inbuf);
+			janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)(peek ? peek->data : NULL);
+			if(pkt != NULL && !pkt->silence) {
+				curBuffer = (opus_int16 *)pkt->data;
+				for(i=0; i<samples; i++) {
+					if(e->volume_gain == 100) {
+						buffer[i] += curBuffer[i];
+					} else {
+						buffer[i] += (curBuffer[i]*e->volume_gain)/100;
+					}
+				}
+			}
+			e->inbuf = g_list_delete_link(e->inbuf, peek);
+			janus_refcount_decrease(&e->ref);
+			g_free(pkt->data);
+			pkt->data = NULL;
+			g_free(pkt);
+			pkt = NULL;
+			janus_mutex_unlock(&e->qmutex);
+			eu = eu->next;
+		}
+
 #ifdef HAVE_LIBOGG
 		/* If there are announcements playing, mix those too */
 		GList *anncs_list = g_hash_table_get_values(audiobridge->anncs);
@@ -6855,4 +7219,209 @@ static void janus_audiobridge_relay_rtp_packet(gpointer data, gpointer user_data
 	/* Restore the timestamp and sequence number to what the mixer set them to */
 	packet->data->timestamp = htonl(packet->timestamp);
 	packet->data->seq_number = htons(packet->seq_number);
+}
+
+void janus_audiobridge_external_audio(janus_audiobridge_external_uploader *uploader, janus_plugin_rtcp *packet) {
+	if (!uploader->decoder || !uploader->room)
+		return;
+	if(uploader->decoder) {
+		/* First of all, check if a reset on the decoder is due */
+		if(uploader->reset) {
+			/* Create a new decoder and get rid of the old one */
+			int error = 0;
+			OpusDecoder *decoder = opus_decoder_create(uploader->room->sampling_rate, 1, &error);
+			if(error != OPUS_OK) {
+				JANUS_LOG(LOG_ERR, "Error resetting Opus decoder...\n");
+			} else {
+				if(uploader->decoder)
+					opus_decoder_destroy(uploader->decoder);
+				uploader->decoder = decoder;
+				JANUS_LOG(LOG_VERB, "Opus decoder reset\n");
+			}
+			uploader->reset = FALSE;
+		}
+		char *buf = packet->buffer; uint16_t len = packet->length;
+		janus_rtp_header *rtp = (janus_rtp_header *)buf;
+		janus_audiobridge_rtp_relay_packet *pkt = g_malloc(sizeof(janus_audiobridge_rtp_relay_packet));
+		pkt->data = g_malloc0(BUFFER_SAMPLES*sizeof(opus_int16));
+		pkt->ssrc = 0;
+		pkt->timestamp = ntohl(rtp->timestamp);
+		pkt->seq_number = ntohs(rtp->seq_number);
+
+		/* We might check the audio level extension to see if this is silence */
+		pkt->silence = FALSE;
+		pkt->length = 0;
+
+		/* First check if probation period */
+		if(uploader->probation == MIN_SEQUENTIAL) {
+			uploader->probation--;
+			uploader->expected_seq = pkt->seq_number + 1;
+			JANUS_LOG(LOG_VERB, "Probation started with ssrc = %"SCNu32", seq = %"SCNu16" \n", ntohl(rtp->ssrc), pkt->seq_number);
+			g_free(pkt->data);
+			g_free(pkt);
+			return;
+		} else if(uploader->probation != 0) {
+			/* Decrease probation */
+			uploader->probation--;
+			/* TODO: Reset probation if sequence number is incorrect and DSSRC also; must have a correct sequence */
+			if(!uploader->probation){
+				/* Probation is ended */
+				JANUS_LOG(LOG_VERB, "Probation ended with ssrc = %"SCNu32", seq = %"SCNu16" \n", ntohl(rtp->ssrc), pkt->seq_number);
+			}
+			uploader->expected_seq = pkt->seq_number + 1;
+			g_free(pkt->data);
+			g_free(pkt);
+			return;
+		}
+
+		if(uploader->extmap_id > 0) {
+			/* Check the audio levels, in case we need to notify uploaders about who's talking */
+			int level = 0;
+			pkt->silence = (level == 127);
+			if(uploader->room && uploader->room->audiolevel_event) {
+				/* We also need to detect who's talking: update our monitoring stuff */
+				int audio_active_packets = uploader->room ? uploader->room->audio_active_packets : 100;
+				int audio_level_average = uploader->room ? uploader->room->audio_level_average : 25;
+				uploader->audio_dBov_sum += level;
+				uploader->audio_active_packets++;
+				uploader->dBov_level = level;
+				if(uploader->audio_active_packets > 0 && uploader->audio_active_packets == audio_active_packets) {
+					if((float) uploader->audio_dBov_sum / (float) uploader->audio_active_packets < audio_level_average) {
+						uploader->audio_active_packets = 0;
+						uploader->audio_dBov_sum = 0;
+					}
+				}
+			}
+		}
+		if(!g_atomic_int_compare_and_exchange(&uploader->decoding, 0, 1)) {
+			/* This means we're cleaning up, so don't try to decode */
+			g_free(pkt->data);
+			g_free(pkt);
+			return;
+		}
+		int plen = 0;
+		const unsigned char *payload = (const unsigned char *)janus_rtp_payload(buf, len, &plen);
+		if(!payload) {
+			g_atomic_int_set(&uploader->decoding, 0);
+			JANUS_LOG(LOG_ERR, "[Opus] Ops! got an error accessing the RTP payload\n");
+			g_free(pkt->data);
+			g_free(pkt);
+			return;
+		}
+
+
+		/* Check sequence number received, verify if it's relevant to the expected one */
+		if(pkt->seq_number == uploader->expected_seq) {
+			/* Regular decode */
+			pkt->length = opus_decode(uploader->decoder, payload, plen, (opus_int16 *)pkt->data, BUFFER_SAMPLES, 0);
+
+			/* Update last_timestamp */
+			uploader->last_timestamp = pkt->timestamp;
+			/* Increment according to previous seq_number */
+			uploader->expected_seq = pkt->seq_number + 1;
+		} else if(pkt->seq_number > uploader->expected_seq) {
+			/* Sequence(s) losts */
+			uint16_t gap = pkt->seq_number - uploader->expected_seq;
+			JANUS_LOG(LOG_HUGE, "%"SCNu16" sequence(s) lost, sequence = %"SCNu16",  expected seq = %"SCNu16" \n",
+					gap, pkt->seq_number, uploader->expected_seq);
+
+			/* Use FEC if sequence lost < DEFAULT_PREBUFFERING */
+			uint16_t start_lost_seq = uploader->expected_seq;
+			if(uploader->fec && gap < DEFAULT_PREBUFFERING) {
+				uint8_t i=0;
+				for(i=0; i<gap ; i++) {
+					int32_t output_samples;
+					janus_audiobridge_rtp_relay_packet *lost_pkt = g_malloc(sizeof(janus_audiobridge_rtp_relay_packet));
+					lost_pkt->data = g_malloc0(BUFFER_SAMPLES*sizeof(opus_int16));
+					lost_pkt->ssrc = 0;
+					lost_pkt->timestamp = uploader->last_timestamp + ((i + 1) * OPUS_SAMPLES);
+					lost_pkt->seq_number = start_lost_seq++;
+					lost_pkt->silence = FALSE;
+					lost_pkt->length = 0;
+					if((i + 1) == gap) {
+						/* Attempt to decode with in-band FEC from next packet */
+						opus_decoder_ctl(uploader->decoder, OPUS_GET_LAST_PACKET_DURATION(&output_samples));
+						lost_pkt->length = opus_decode(uploader->decoder, payload, plen, (opus_int16 *)lost_pkt->data, output_samples, 1);
+					} else {
+						opus_decoder_ctl(uploader->decoder, OPUS_GET_LAST_PACKET_DURATION(&output_samples));
+						lost_pkt->length = opus_decode(uploader->decoder, NULL, plen, (opus_int16 *)lost_pkt->data, output_samples, 1);
+					}
+					if(lost_pkt->length < 0) {
+						g_atomic_int_set(&uploader->decoding, 0);
+						JANUS_LOG(LOG_ERR, "[Opus] Ops! got an error decoding the Opus frame: %d (%s)\n", lost_pkt->length, opus_strerror(lost_pkt->length));
+						g_free(lost_pkt->data);
+						g_free(lost_pkt);
+						return;
+					}
+					/* Enqueue the decoded frame */
+					janus_mutex_lock(&uploader->qmutex);
+					/* Insert packets sorting by sequence number */
+					uploader->inbuf = g_list_insert_sorted(uploader->inbuf, lost_pkt, &janus_audiobridge_rtp_sort);
+					janus_mutex_unlock(&uploader->qmutex);
+				}
+			}
+			/* Then go with the regular decode (no FEC) */
+			pkt->length = opus_decode(uploader->decoder, payload, plen, (opus_int16 *)pkt->data, BUFFER_SAMPLES, 0);
+			/* Increment according to previous seq_number */
+			uploader->expected_seq = pkt->seq_number + 1;
+		} else {
+			/* In late sequence or sequence wrapped */
+			g_atomic_int_set(&uploader->decoding, 0);
+			if((uploader->expected_seq - pkt->seq_number) > MAX_MISORDER){
+				JANUS_LOG(LOG_HUGE, "SN WRAPPED seq =  %"SCNu16", expected_seq =  %"SCNu16" \n", pkt->seq_number, uploader->expected_seq);
+				uploader->expected_seq = pkt->seq_number + 1;
+			} else {
+				JANUS_LOG(LOG_WARN, "IN LATE SN seq =  %"SCNu16", expected_seq =  %"SCNu16" \n", pkt->seq_number, uploader->expected_seq);
+			}
+			g_free(pkt->data);
+			g_free(pkt);
+			return;
+		}
+		g_atomic_int_set(&uploader->decoding, 0);
+		if(pkt->length < 0) {
+			JANUS_LOG(LOG_ERR, "[Opus] Ops! got an error decoding the Opus frame: %d (%s)\n", pkt->length, opus_strerror(pkt->length));
+			g_free(pkt->data);
+			g_free(pkt);
+			return;
+		}
+		/* Enqueue the decoded frame */
+		janus_mutex_lock(&uploader->qmutex);
+		/* Insert packets sorting by sequence number */
+		uploader->inbuf = g_list_insert_sorted(uploader->inbuf, pkt, &janus_audiobridge_rtp_sort);
+		if(uploader->prebuffering) {
+			/* Still pre-buffering: do we have enough packets now? */
+			if(g_list_length(uploader->inbuf) > DEFAULT_PREBUFFERING) {
+				uploader->prebuffering = FALSE;
+				JANUS_LOG(LOG_VERB, "Prebuffering done! Finally adding the user to the mix\n");
+			} else {
+				JANUS_LOG(LOG_VERB, "Still prebuffering (got %d packets), not adding the user to the mix yet\n", g_list_length(uploader->inbuf));
+			}
+		} else {
+			/* Make sure we're not queueing too many packets: if so, get rid of the older ones */
+			if(g_list_length(uploader->inbuf) >= DEFAULT_PREBUFFERING*2) {
+				gint64 now = janus_get_monotonic_time();
+				if(now - uploader->last_drop > 5*G_USEC_PER_SEC) {
+					JANUS_LOG(LOG_VERB, "Too many packets in queue (%d > %d), removing older ones\n",
+							g_list_length(uploader->inbuf), DEFAULT_PREBUFFERING*2);
+					uploader->last_drop = now;
+				}
+				while(g_list_length(uploader->inbuf) > DEFAULT_PREBUFFERING) {
+					/* Remove this packet: it's too old */
+					GList *first = g_list_first(uploader->inbuf);
+					janus_audiobridge_rtp_relay_packet *pkt = (janus_audiobridge_rtp_relay_packet *)first->data;
+					JANUS_LOG(LOG_WARN, "list length = %d, Remove sequence = %d\n",
+							g_list_length(uploader->inbuf), pkt->seq_number);
+					uploader->inbuf = g_list_remove_link(uploader->inbuf, first);
+					first = NULL;
+					if(pkt == NULL)
+						continue;
+					g_free(pkt->data);
+					pkt->data = NULL;
+					g_free(pkt);
+					pkt = NULL;
+				}
+			}
+		}
+		janus_mutex_unlock(&uploader->qmutex);
+	}
 }
