@@ -1,4 +1,4 @@
-AC_INIT([Janus WebRTC Server],[0.7.0],[https://github.com/meetecho/janus-gateway],[janus-gateway],[https://janus.conf.meetecho.com])
+AC_INIT([Janus WebRTC Server],[0.7.1],[https://github.com/meetecho/janus-gateway],[janus-gateway],[https://janus.conf.meetecho.com])
 AC_LANG(C)
 AC_CONFIG_AUX_DIR([.])
 AC_CONFIG_MACRO_DIR([m4])
@@ -69,9 +69,9 @@ clang*)
 		-Wunused-but-set-variable"
 esac
 
-JANUS_VERSION=70
+JANUS_VERSION=71
 AC_SUBST(JANUS_VERSION)
-JANUS_VERSION_STRING="0.7.0"
+JANUS_VERSION_STRING="0.7.1"
 AC_SUBST(JANUS_VERSION_STRING)
 
 case "$host_os" in
@@ -299,7 +299,7 @@ PKG_CHECK_MODULES([JANUS],
                     libssl >= $ssl_version
                     libcrypto
                   ])
-JANUS_MANUAL_LIBS+=" -lm"
+JANUS_MANUAL_LIBS="${JANUS_MANUAL_LIBS} -lm"
 AC_SUBST(JANUS_MANUAL_LIBS)
 
 AS_IF([test "x${boringssl_dir}" != "x"],
@@ -349,8 +349,10 @@ AC_CHECK_LIB([nice],
 
 AC_CHECK_LIB([dl],
              [dlopen],
-             [JANUS_MANUAL_LIBS+=" -ldl"],
+             [JANUS_MANUAL_LIBS="${JANUS_MANUAL_LIBS} -ldl"],
              [AC_MSG_ERROR([libdl not found.])])
+
+AC_CHECK_LIB(uuid, main,,AC_MSG_ERROR(please install libuuid))
 
 AM_CONDITIONAL([ENABLE_LIBSRTP_2], false)
 AS_IF([test "x$enable_libsrtp2" != "xno"],
@@ -360,7 +362,7 @@ AS_IF([test "x$enable_libsrtp2" != "xno"],
                       AC_CHECK_HEADER([srtp2/srtp.h],
                                       [
                                         AC_DEFINE(HAVE_SRTP_2)
-                                        JANUS_MANUAL_LIBS+=" -lsrtp2"
+                                        JANUS_MANUAL_LIBS="${JANUS_MANUAL_LIBS} -lsrtp2"
                                         enable_libsrtp2=yes
                                         AM_CONDITIONAL([ENABLE_LIBSRTP_2], true)
                                         AC_CHECK_LIB([srtp2],
@@ -385,7 +387,7 @@ AM_COND_IF([ENABLE_LIBSRTP_2],
                          [
                            AC_CHECK_HEADER([srtp/srtp.h],
                                            [
-                                             JANUS_MANUAL_LIBS+=" -lsrtp"
+                                             JANUS_MANUAL_LIBS="${JANUS_MANUAL_LIBS} -lsrtp"
                                              enable_libsrtp2=no
                                              PKG_CHECK_MODULES([SRTP15X],
                                                                [
@@ -407,7 +409,7 @@ AC_CHECK_LIB([usrsctp],
                AS_IF([test "x$enable_data_channels" != "xno"],
                [
                   AC_DEFINE(HAVE_SCTP)
-                  JANUS_MANUAL_LIBS+=" -lusrsctp"
+                  JANUS_MANUAL_LIBS="${JANUS_MANUAL_LIBS} -lusrsctp"
                   enable_data_channels=yes
                ])
              ],
@@ -421,7 +423,7 @@ PKG_CHECK_MODULES([LIBCURL],
                   [libcurl],
                   [
                     AC_DEFINE(HAVE_LIBCURL)
-                    JANUS_MANUAL_LIBS+=" -lcurl"
+                    JANUS_MANUAL_LIBS="${JANUS_MANUAL_LIBS} -lcurl"
                     AS_IF(
                       [test "x$enable_turn_rest_api" != "xno"],
                       [
